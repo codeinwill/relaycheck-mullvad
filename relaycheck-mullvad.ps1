@@ -6,7 +6,7 @@
 # Each run (about a minute):
 #   1. Pings a ladder of targets 50 times each, all at once:
 #        home network        your router (default gateway)
-#        your isp            your isp's first router, 1.1.1.1 and 8.8.8.8 (anycast, served near you)
+#        your isp            your ISP's first router, 1.1.1.1 and 8.8.8.8 (anycast, served near you)
 #        isp international   2 Mullvad servers at the nearest location outside your country
 #        region              every Mullvad server in the reference city (-RefCity, default los angeles)
 #        city                every Mullvad server in the city under test (-City, default seattle), by provider
@@ -47,7 +47,7 @@ param(
 # Loss thresholds (percent of pings lost): a target is clean at $CleanPct or less, lossy at $BadPct or
 # more or when it gives no reply. A level is minor up to $GroupOk of its targets lossy, a problem from
 # $GroupBad, degraded in between. A provider is only named when $BlameMin of its servers are lossy.
-# The international check uses $IntlCount servers at the nearest Mullvad location abroad over $AbroadKm away.
+# The international check is $IntlCount servers at the nearest Mullvad location abroad (over $AbroadKm km).
 # $Ookla lists the preferred speedtest.net servers per city, so each run tests against the same one.
 # Times are stored in the invariant culture, so the database reads the same on any Windows language.
 
@@ -976,18 +976,20 @@ function Get-HeadlineDefinition($run) {
   $d = $run.Diag
   $sv = $d.Severity
   $rg = { param($n) (Get-Ranges $n).$sv }
+  $cn = Format-Html $run.CityName
+  $rn = Format-Html $run.RefName
   $def = switch ($d.Level) {
     "home" { "$sv means your router lost $BadPct% or more of pings ($(Get-LostPings) or more of $($run.Pings)) or gave no reply." }
     "isp" { "$sv means $(& $rg $d.Isp.N) of $($d.Isp.N) targets near you are lossy." }
     "isp-intl" { "$sv means $(& $rg $d.Intl.N) of $($d.Intl.N) servers abroad are lossy." }
-    "region" { "$sv means $(& $rg $d.Sea.N) of $($d.Sea.N) $($run.CityName) servers are lossy, and $($run.RefName) is at least as bad ($($d.La.Bad) of $($d.La.N))." }
-    "city" { "$sv means $(& $rg $d.Sea.N) of $($d.Sea.N) $($run.CityName) servers are lossy, spread across providers." }
+    "region" { "$sv means $(& $rg $d.Sea.N) of $($d.Sea.N) $cn servers are lossy, and $rn is at least as bad ($($d.La.Bad) of $($d.La.N))." }
+    "city" { "$sv means $(& $rg $d.Sea.N) of $($d.Sea.N) $cn servers are lossy, spread across providers." }
     "provider" { (@($d.Providers | Where-Object { $d.Blamed -contains $_.Provider }) | ForEach-Object { "$sv means $(& $rg $_.N) of $($_.N) $(Format-Html $_.Provider) servers are lossy" }) -join "; " }
-    "server" { "minor means some $($run.CityName) servers are lossy, but no level above is degraded or a problem." }
+    "server" { "minor means some $cn servers are lossy, but no level above is degraded or a problem." }
     default { $null }
   }
-  # The home definition already gives the router's threshold; every other level also needs a target's
-  if ($def -and $d.Level -ne "home") { $def =$def.TrimEnd(".") + ". a server or site is lossy at $BadPct% loss or more ($(Get-LostPings) or more of $($run.Pings) pings) or gives no reply." }
+  # Every level but home also gets the lossy threshold for one target; home's definition already gives it
+  if ($def -and $d.Level -ne "home") { $def = $def.TrimEnd(".") + ". a server or site is lossy at $BadPct% loss or more ($(Get-LostPings) or more of $($run.Pings) pings) or gives no reply." }
   $def
 }
 
@@ -1351,12 +1353,21 @@ function Start-Server([int]$port) {
 
         switch -regex ($path) {
           '^/(relaycheck-mullvad\.html)?(\?.*)?$' {
-            # Before the first report, start a check if none is running and serve a page that reloads until it's done
+            # Before the first report, start one check and serve a page that reloads until there is a report.
+            # Only one: a check that fails writes no report, and starting another on every reload would keep
+            # turning the vpn off.
             if (Test-Path $Report) {
               $body = [IO.File]::ReadAllBytes($Report)
             } else {
-              & $startRun
-              $body = [Text.Encoding]::UTF8.GetBytes("<!doctype html><html lang=en><head><meta charset=utf-8><meta http-equiv=refresh content=5><title>Relaycheck Mullvad</title></head><body><p>no report yet. the first check is running and takes about a minute; this page reloads when it&rsquo;s done.</p></body></html>")
+              if (-not $st.Started) { & $startRun }
+              $wait = if ($st.Child -and -not $st.Child.HasExited) {
+                5, "the first check is running and takes about a minute; this page reloads when it&rsquo;s done."
+              } elseif ($st.Next) {
+                30, "the first check finished without a report, usually because the internet connection failed. the next check starts at $($st.Next.ToString("HH:mm", $Inv))."
+              } else {
+                30, "the first check finished without a report, usually because the internet connection failed. restart relaycheck-mullvad to try again."
+              }
+              $body = [Text.Encoding]::UTF8.GetBytes("<!doctype html><html lang=en><head><meta charset=utf-8><meta http-equiv=refresh content=$($wait[0])><title>Relaycheck Mullvad</title></head><body><p>no report yet. $($wait[1])</p></body></html>")
             }
             & $send $ns "200 OK" "text/html; charset=utf-8" $body
             break

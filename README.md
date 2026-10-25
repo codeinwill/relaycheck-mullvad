@@ -84,7 +84,7 @@ The app is found automatically, on your `PATH` or in `C:\Program Files\Mullvad V
 - **Recommended Server:** the server to use and a backup, with loss, latency and 24h track record.
 - **Where's The Problem:** the headline and the full ladder. Each level shows what was tested and what its state means.
 - **Speed To Seattle:** download and upload, direct and through the VPN.
-- **Seattle Servers and Los Angeles Servers:** every server's loss, latency, jitter, and how often it was clean over 24 hours and 7 days.
+- **Seattle Servers and Los Angeles Servers:** every server's loss, latency, jitter and how often it was clean over 24 hours and 7 days.
 - **Recent Runs:** history, and a **Flush Older Than 7 Days** button.
 
 ## Running it by hand
