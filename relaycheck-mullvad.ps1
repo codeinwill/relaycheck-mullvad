@@ -7,7 +7,7 @@
 #   1. Pings a ladder of targets 50 times each, all at once:
 #        home network        your router (default gateway)
 #        your isp            your isp's first router, 1.1.1.1 and 8.8.8.8 (anycast, served near you)
-#        isp international   the 2 nearest Mullvad servers outside your country
+#        isp international   2 Mullvad servers at the nearest location outside your country
 #        region              every Mullvad server in the reference city (-RefCity, default los angeles)
 #        city                every Mullvad server in the city under test (-City, default seattle), by provider
 #   2. Gives every level a state from its share of lossy targets: clean (none), minor (up to 25%),
@@ -47,6 +47,7 @@ param(
 # Loss thresholds (percent of pings lost): a target is clean at $CleanPct or less, lossy at $BadPct or
 # more or when it gives no reply. A level is minor up to $GroupOk of its targets lossy, a problem from
 # $GroupBad, degraded in between. A provider is only named when $BlameMin of its servers are lossy.
+# The international check uses $IntlCount servers at the nearest Mullvad location abroad over $AbroadKm away.
 # $Ookla lists the preferred speedtest.net servers per city, so each run tests against the same one.
 # Times are stored in the invariant culture, so the database reads the same on any Windows language.
 
@@ -61,6 +62,7 @@ $GroupBad  = 0.6
 $BlameMin  = 2
 $SlowMbps  = 10
 $IntlCount = 2
+$AbroadKm  = 150
 $HistHours = 24
 $HistRows  = 24
 $FlushDays = 7
@@ -390,7 +392,7 @@ function Get-Here($relays) {
       $f = $_.Group[0]
       [pscustomobject]@{ Country = $f.Country; City = $f.City; Km = (Get-Km $here.Lat $here.Lon $f.Lat $f.Lon); Relays = $_.Group }
     }
-    $abroad = $locations | Where-Object { $_.Country -ne $mine -and $_.Km -gt 150 } | Sort-Object Km | Select-Object -First 1
+    $abroad = $locations | Where-Object { $_.Country -ne $mine -and $_.Km -gt $AbroadKm } | Sort-Object Km | Select-Object -First 1
     if ($abroad) {
       $here.Intl = @($abroad.Relays | Select-Object -First $IntlCount)
       $here.IntlPlace = "$($abroad.City), $($abroad.Country)"
@@ -578,7 +580,8 @@ function Test-Speed($server) {
 }
 
 function Get-SpeedNotes($d, $v, $pick) {
-  $dn = if (-not $v -or $v.Down -eq $null) { "couldn't test the vpn via $($pick.Name)." }
+  $dn = if (-not $Mullvad) { "the mullvad app isn't installed, so only the direct speed was tested." }
+    elseif (-not $v -or $v.Down -eq $null) { "couldn't test the vpn via $($pick.Name)." }
     elseif ($d.Down -eq $null) { "couldn't test direct download, so there's nothing to compare the vpn with." }
     elseif ($d.Down -lt $SlowMbps -and $v.Down -lt $SlowMbps) { "this city is slow even without the vpn (direct download $($d.Down) mbps), so the route is the bottleneck, not mullvad." }
     elseif ($d.Down -lt $SlowMbps) { "direct download was unusually slow this time ($($d.Down) mbps), so there's no fair comparison; the vpn got $($v.Down) mbps." }
@@ -605,7 +608,7 @@ function Get-Ranges([int]$n) {
   $minorMax = [math]::Floor($GroupOk * $n)
   $probMin = [math]::Max(1, [math]::Ceiling($GroupBad * $n))
   $span = { param($lo, $hi) if ($lo -gt $hi) { $null } elseif ($lo -eq $hi) { "$lo" } else { "$lo&ndash;$hi" } }
-  [pscustomobject]@{ Clean = "0"; Minor = (& $span 1 $minorMax); Degraded = (& $span ($minorMax + 1) ($probMin - 1)); Problem = (& $span $probMin $n) }
+  [pscustomobject]@{ Minor = (& $span 1 $minorMax); Degraded = (& $span ($minorMax + 1) ($probMin - 1)); Problem = (& $span $probMin $n) }
 }
 
 function Get-Status($items) {
@@ -649,7 +652,7 @@ function Get-Diagnosis($res, $here, $cityName, $refName) {
     [pscustomobject]@{ Provider = $p.Name; Status = $s.Status; Bad = $s.Bad; N = $s.N }
   })
   $lossy = @($sea | Where-Object { Test-Lossy $_ })
-  $where = if ($here.Country) { $here.Country.ToLower() } else { "your country" }
+  $where = if ($here.Country) { $here.Country.ToLowerInvariant() } else { "your country" }
 
   $provLine = { param($ps) (@($ps) | ForEach-Object { $pv = $_.Provider; "provider ${pv}: $($_.Bad) of $($_.N) lossy ($(Format-Lossy @($lossy | Where-Object { $_.Provider -eq $pv })))" }) -join " $Dot " }
   $okLine = { param($ps) (@($ps) | ForEach-Object { "provider $($_.Provider): $($_.Bad) of $($_.N) lossy" }) -join " $Dot " }
@@ -786,8 +789,8 @@ function Invoke-Run {
     }
     $cityRelays = @($relays | Where-Object { $_.CityCode -eq $City })
     $refRelays = @($relays | Where-Object { $_.CityCode -eq $RefCity })
-    $cityName = if ($cityRelays.Count) { $cityRelays[0].City.ToLower() } else { $City }
-    $refName = if ($refRelays.Count) { $refRelays[0].City.ToLower() } else { $RefCity }
+    $cityName = if ($cityRelays.Count) { $cityRelays[0].City.ToLowerInvariant() } else { $City }
+    $refName = if ($refRelays.Count) { $refRelays[0].City.ToLowerInvariant() } else { $RefCity }
     $here = Get-Here $relays
 
     $targets = @(Get-Targets $here $cityRelays $refRelays $cityName $refName)
@@ -882,7 +885,7 @@ function Save-Run($run) {
 
 # ---------------------------------------------------------------- report
 # Headings, table headers and buttons are Title Case; all other page text is lower case (Format-Html lowercases it)
-function Format-Html($s) { [System.Net.WebUtility]::HtmlEncode(([string]$s).ToLower()) }
+function Format-Html($s) { [System.Net.WebUtility]::HtmlEncode(([string]$s).ToLowerInvariant()) }
 
 function Format-Mbps($v) {
   if ($v -eq $null) { "&ndash;" } else { "{0} mbps" -f ([double]$v).ToString("0.0", $Inv) }
@@ -923,8 +926,9 @@ function Format-Ladder($run) {
   $cityRes = @(Select-Group $res $run.CityName)
 
   $step = {
-    param($label, $s, $detail, $lvl, $tested, $n, $defText, [switch]$Hit)
-    if (-not $defText -and $s -in "minor", "degraded", "problem" -and $n) {
+    param($label, $s, $detail, $lvl, $tested, $n, [switch]$Hit)
+    $defText = $null
+    if ($s -in "minor", "degraded", "problem" -and $n) {
       $r = (Get-Ranges $n).$s
       if ($r) { $defText = "$s = $r of $n lossy" }
     }
@@ -944,12 +948,17 @@ function Format-Ladder($run) {
     }
     $lines -join "<br>"
   }
-  $cnt = { param($s) if ($s.N) { "$($s.Bad) of $($s.N) lossy" } else { "nothing to test" } }
+  $cnt = {
+    param($s, $g)
+    if ($s.N) { "$($s.Bad) of $($s.N) lossy" }
+    elseif ($g -and @(Select-Group $res $g | Where-Object { $_.Ignored }).Count) { "not counted" }
+    else { "nothing to test" }
+  }
 
   $homeTested = if ($h.Gateway) { & $each "home network" } else { "no default gateway found" }
   $intlTested = if ($h.IntlPlace) { "nearest mullvad location abroad: $(Format-Html $h.IntlPlace)<br>" + (& $each "isp international") } else { "couldn't work out your location" }
   $out = @(
-    (& $step "home network" $d.Home.Status (& $cnt $d.Home) "home" $homeTested $d.Home.N),
+    (& $step "home network" $d.Home.Status (& $cnt $d.Home "home network") "home" $homeTested $d.Home.N),
     (& $step "your isp" $d.Isp.Status (& $cnt $d.Isp) "isp" (& $each "your isp") $d.Isp.N),
     (& $step "isp international" $d.Intl.Status (& $cnt $d.Intl) "isp-intl" $intlTested $d.Intl.N),
     (& $step $RegionName $d.La.Status (& $cnt $d.La) "region" "all $($d.La.N) mullvad $(Format-Html $run.RefName) servers (listed below)" $d.La.N),
@@ -968,7 +977,7 @@ function Get-HeadlineDefinition($run) {
   $sv = $d.Severity
   $rg = { param($n) (Get-Ranges $n).$sv }
   $def = switch ($d.Level) {
-    "home" { "$sv means your router lost $(Get-LostPings) or more of $($run.Pings) pings or gave no reply." }
+    "home" { "$sv means your router lost $BadPct% or more of pings ($(Get-LostPings) or more of $($run.Pings)) or gave no reply." }
     "isp" { "$sv means $(& $rg $d.Isp.N) of $($d.Isp.N) targets near you are lossy." }
     "isp-intl" { "$sv means $(& $rg $d.Intl.N) of $($d.Intl.N) servers abroad are lossy." }
     "region" { "$sv means $(& $rg $d.Sea.N) of $($d.Sea.N) $($run.CityName) servers are lossy, and $($run.RefName) is at least as bad ($($d.La.Bad) of $($d.La.N))." }
@@ -977,7 +986,8 @@ function Get-HeadlineDefinition($run) {
     "server" { "minor means some $($run.CityName) servers are lossy, but no level above is degraded or a problem." }
     default { $null }
   }
-  if ($def) { $def = $def.TrimEnd(".") + ". a server or site is lossy at $BadPct% loss or more ($(Get-LostPings) or more of $($run.Pings) pings) or gives no reply." }
+  # The home definition already gives the router's threshold; every other level also needs a target's
+  if ($def -and $d.Level -ne "home") { $def =$def.TrimEnd(".") + ". a server or site is lossy at $BadPct% loss or more ($(Get-LostPings) or more of $($run.Pings) pings) or gives no reply." }
   $def
 }
 
@@ -1099,6 +1109,8 @@ $ReportJs = @'
   }
 
   function show(s) {
+    stop.hidden = false;
+    fl.hidden = false;
     if (s.running) {
       btn.disabled = true;
       btn.textContent = "Running" + String.fromCharCode(8230);
@@ -1159,8 +1171,6 @@ $ReportJs = @'
   });
 
   if (location.protocol === "file:") { off(); return; }
-  stop.hidden = false;
-  fl.hidden = false;
   poll();
   timer = setInterval(poll, 3000);
 })();
@@ -1173,13 +1183,13 @@ function Write-Report($run) {
   $d = $run.Diag
   $p = $run.Pick
   $h = $run.Here
-  $tc = (Get-Culture).TextInfo
+  $tc = $Inv.TextInfo
 
   $off = [TimeZoneInfo]::Local.GetUtcOffset([datetime]::Now)
   $sign = if ($off -lt [TimeSpan]::Zero) { "-" } else { "+" }
   $mins = if ($off.Minutes) { ":{0:00}" -f [math]::Abs($off.Minutes) } else { "" }
   $utc = "utc$sign$([math]::Abs($off.Hours))$mins"
-  $when = ([datetime]::ParseExact($run.Time, $TimeFmt, $Inv)).ToString("d MMM yyyy, HH:mm", $Inv).ToLower()
+  $when = ([datetime]::ParseExact($run.Time, $TimeFmt, $Inv)).ToString("d MMM yyyy, HH:mm", $Inv).ToLowerInvariant()
   $place = @($h.City, $h.Country) | Where-Object { $_ }
   $from = @($h.Ip, $h.Isp, ($place -join ", ")) | Where-Object { $_ }
   $from = $from -join " $Dot "
@@ -1328,7 +1338,7 @@ function Start-Server([int]$port) {
         $method, $path = ($lines[0] -split " ")[0, 1]
         $hdrs = @{}
         foreach ($l in $lines[1..($lines.Count - 1)]) {
-          if ($l -match '^([^:]+):\s*(.*)$') { $hdrs[$matches[1].ToLower()] = $matches[2] }
+          if ($l -match '^([^:]+):\s*(.*)$') { $hdrs[$matches[1].ToLowerInvariant()] = $matches[2] }
         }
         if ($hdrs["host"] -notmatch "^(localhost|127\.0\.0\.1):$port$") {
           & $forbid $ns
@@ -1341,7 +1351,13 @@ function Start-Server([int]$port) {
 
         switch -regex ($path) {
           '^/(relaycheck-mullvad\.html)?(\?.*)?$' {
-            $body = if (Test-Path $Report) { [IO.File]::ReadAllBytes($Report) } else { [Text.Encoding]::UTF8.GetBytes("<p>no report yet. press run now in a moment.</p>") }
+            # Before the first report, start a check if none is running and serve a page that reloads until it's done
+            if (Test-Path $Report) {
+              $body = [IO.File]::ReadAllBytes($Report)
+            } else {
+              & $startRun
+              $body = [Text.Encoding]::UTF8.GetBytes("<!doctype html><html lang=en><head><meta charset=utf-8><meta http-equiv=refresh content=5><title>Relaycheck Mullvad</title></head><body><p>no report yet. the first check is running and takes about a minute; this page reloads when it&rsquo;s done.</p></body></html>")
+            }
             & $send $ns "200 OK" "text/html; charset=utf-8" $body
             break
           }

@@ -28,7 +28,7 @@ By default it checks Mullvad's Seattle servers and uses Los Angeles as the West 
 ## Requirements
 
 - Windows 10 or 11, with Windows PowerShell 5.1 (built in)
-- Nothing else to install: the database uses the SQLite library that ships with Windows (`winsqlite3.dll`).
+- Nothing else to install: the database uses the SQLite library that ships with Windows (`winsqlite3.dll`), and the speed test uses `curl.exe`, which ships with Windows 10 1803 and later.
 - The [Mullvad VPN app](https://mullvad.net/download) is optional; see below.
 
 ### With or without the Mullvad app
@@ -57,7 +57,7 @@ The app is found automatically, on your `PATH` or in `C:\Program Files\Mullvad V
    |---|---|
    | home network | your router (the default gateway) |
    | your isp | your ISP's first router, 1.1.1.1 and 8.8.8.8 (both answer from near you) |
-   | isp international | the 2 nearest Mullvad servers outside your country |
+   | isp international | 2 Mullvad servers at the nearest location outside your country (more than 150 km away) |
    | us-west-coast | every Mullvad server in the reference city (Los Angeles) |
    | seattle | every Mullvad server in the city under test |
    | provider | the city's servers grouped by hosting company |
@@ -78,8 +78,6 @@ The app is found automatically, on your `PATH` or in `C:\Program Files\Mullvad V
 4. **Runs a speed test** on speedtest.net, the same server each time: first direct, then through the recommended server. It measures download and upload.
 
 5. **Saves the results** to `relaycheck-mullvad.db` and rebuilds `relaycheck-mullvad.html`.
-
-The laptop's Mullvad app is disconnected while pinging, so the pings take the real route. It's connected to the recommended server only for the speed test, then put back the way it was. If your router runs a Mullvad tunnel that carries the laptop's traffic, the page warns you, and that run doesn't count towards the track record.
 
 ## Dashboard
 
@@ -110,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File relaycheck-mullvad.ps1 -City lax -RefCi
 | `-Port` | `8765` | dashboard port |
 | `-NoSpeed` | off | skip the speed test |
 
-The thresholds (clean and lossy loss, state shares, history windows) are at the top of `relaycheck-mullvad.ps1`.
+The thresholds (clean and lossy loss, state shares, history windows, the international check's distance) are at the top of `relaycheck-mullvad.ps1`.
 
 ## Files
 
