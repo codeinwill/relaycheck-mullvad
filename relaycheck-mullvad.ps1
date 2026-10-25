@@ -13,9 +13,12 @@
 #   2. Gives every level a state from its share of lossy targets: clean (none), minor (up to 25%),
 #      degraded (over 25%, under 60%), problem (60% or more). The headline is the first level from
 #      the top that is a problem, else the first that is degraded, else any lossy city servers as minor.
+#      The region is only named when the city is at least as bad; on its own it isn't the headline.
 #   3. Recommends the city server that is clean now and has the best 24h track record, plus a
-#      backup from a different provider.
-#   4. Speed test (speedtest.net, same server each time): direct, then through the recommended server.
+#      backup from a different provider, among the servers the Mullvad app's provider and ownership
+#      settings allow.
+#   4. Speed test (speedtest.net, the same server each time for seattle and los angeles): direct, then
+#      through the recommended server.
 #   5. Saves to relaycheck-mullvad.db and rebuilds relaycheck-mullvad.html.
 #
 # The laptop's Mullvad app is disconnected while pinging (so pings take the real route), connected to
@@ -35,7 +38,7 @@
 param(
   [switch]$NoSpeed,
   [int]$Loop = 0,
-  [int]$Pings = 50,
+  [ValidateRange(1, 1000)][int]$Pings = 50,
   [switch]$Serve,
   [int]$Port = 8765,
   [string]$City = "sea",
@@ -46,7 +49,8 @@ param(
 # ---------------------------------------------------------------- settings
 # Loss thresholds (percent of pings lost): a target is clean at $CleanPct or less, lossy at $BadPct or
 # more or when it gives no reply. A level is minor up to $GroupOk of its targets lossy, a problem from
-# $GroupBad, degraded in between. A provider is only named when $BlameMin of its servers are lossy.
+# $GroupBad, degraded in between. A provider is only named when $BlameMin or more of its servers are
+# lossy and another provider is healthier.
 # The international check is $IntlCount servers at the nearest Mullvad location abroad (over $AbroadKm km).
 # $Ookla lists the preferred speedtest.net servers per city, so each run tests against the same one.
 # Times are stored in the invariant culture, so the database reads the same on any Windows language.
@@ -295,9 +299,31 @@ function Set-RelayHost($name) {
 }
 
 function Get-VpnState {
-  if (-not $Mullvad) { return [pscustomobject]@{ Up = $false; Location = $null } }
-  $loc = (@(& $Mullvad relay get) | Select-String '^\s*Location:') -replace '.*Location:\s*', ""
-  [pscustomobject]@{ Up = (Test-VpnUp); Location = "$loc".Trim() }
+  if (-not $Mullvad) { return [pscustomobject]@{ Up = $false; Location = $null; Ownership = "any"; Providers = @(); Lockdown = $false } }
+
+  # From "relay get": "Location: city sea, us, hostname us-sea-wg-001", "Provider(s): any" or a comma list,
+  # "Ownership: any", Mullvad-owned or rented
+  $relay = @(& $Mullvad relay get)
+  $field = {
+    param($name)
+    $line = ($relay | Select-String "^\s*$([regex]::Escape($name)):" | Select-Object -First 1).Line
+    "$line" -replace "^\s*$([regex]::Escape($name)):\s*", ""
+  }
+  $own = & $field "Ownership"
+  $prov = (& $field "Provider(s)").Trim()
+  [pscustomobject]@{
+    Up        = (Test-VpnUp)
+    Location  = (& $field "Location").Trim()
+    Ownership = $(if ($own -match 'rented') { "rented" } elseif ($own -match 'owned') { "owned" } else { "any" })
+    Providers = @(if ($prov -and $prov -ne "any") { $prov -split '\s*,\s*' })
+    Lockdown  = [bool](@(& $Mullvad lockdown-mode get 2>$null) -match ':\s*on\s*$')
+  }
+}
+
+function Test-Allowed($relay, $vpn) {
+  # Whether the app's provider and ownership settings let it connect to this server
+  ($vpn.Ownership -eq "any" -or $relay.Owned -eq ($vpn.Ownership -eq "owned")) -and
+    (-not $vpn.Providers.Count -or $vpn.Providers -contains $relay.Provider)
 }
 
 function Restore-Vpn($s) {
@@ -338,6 +364,7 @@ function Get-Relays {
     [pscustomobject]@{
       Name     = $r.hostname
       Provider = $r.provider
+      Owned    = [bool]$r.owned
       IP       = $r.ipv4_addr_in
       Location = $r.location
       CityCode = $cityCode
@@ -417,6 +444,7 @@ function Get-Targets($here, $cityRelays, $refRelays, $cityName, $refName) {
     $x.Ms = $null
     $x.Jitter = $null
     $x.Ignored = $false
+    $x.Why = $null
   }
   $t
 }
@@ -460,10 +488,16 @@ function Test-Targets($targets) {
   $pool.Close()
   $pool.Dispose()
 
-  # A router that never answers ping (some block it) says nothing about loss, so leave it out when later levels answer
+  # A router that never answers ping (some block it) says nothing about loss, so leave it out when later levels answer.
+  # Many routers also drop some pings aimed at themselves while passing traffic fine: when 1.1.1.1 and 8.8.8.8, which
+  # are reached through every router, are clean, a router's own loss is that limit, not real loss.
   $answering = @($out | Where-Object { -not $_.Infra -and $_.Ms -ne $null }).Count
+  $near = @($out | Where-Object { $_.Grp -eq "your isp" -and -not $_.Infra })
+  $nearClean = $near.Count -and -not @($near | Where-Object { -not (Test-Clean $_) }).Count
   foreach ($r in $out) {
-    if ($r.Infra -and $r.Ms -eq $null -and $answering) { $r.Ignored = $true }
+    if (-not $r.Infra) { continue }
+    if ($r.Ms -eq $null -and $answering) { $r.Ignored = $true; $r.Why = "ignores ping" }
+    elseif ($r.Ms -ne $null -and (Test-Lossy $r) -and $nearClean) { $r.Ignored = $true; $r.Why = "loss $($r.Loss)%, but it limits pings to itself" }
   }
   $out
 }
@@ -713,7 +747,7 @@ function Format-Server($r) {
 }
 
 function Get-History($db, $grp, [datetime]$since) {
-  # Saved runs and clean runs per server since a time; runs through a router tunnel don't count
+  # Saved runs and clean runs per server since a time; runs through a mullvad tunnel outside the app don't count
   $sql = "SELECT c.name, COUNT(*) AS n, SUM(CASE WHEN c.ms IS NOT NULL AND c.loss <= ? THEN 1 ELSE 0 END) AS clean
           FROM checks c JOIN runs r ON r.id = c.run_id
           WHERE c.grp = ? AND r.time >= ? AND COALESCE(r.router_vpn, 0) = 0
@@ -759,14 +793,18 @@ function Get-Ranked($db, $grp, $list) {
   @($rows | Sort-Object @{ e = { -[int]$_.CleanNow } }, @{ e = { -$_.Score } }, @{ e = $byLoss }, @{ e = $byMs })
 }
 
-function Get-Pick($db, $cityRes, $cityName) {
+function Get-Pick($db, $cityRes, $cityName, $allowed) {
+  # Only servers the mullvad app's provider and ownership settings allow, unless they allow none of these
   $ranked = @(Get-Ranked $db $cityName $cityRes)
-  $pick = $ranked | Select-Object -First 1
-  $backup = $ranked | Select-Object -Skip 1 | Where-Object { $_.Provider -ne $pick.Provider } | Select-Object -First 1
-  if (-not $backup) { $backup = $ranked | Select-Object -Skip 1 -First 1 }
+  $pool = @($ranked | Where-Object { $allowed -contains $_.Name })
+  $limited = $pool.Count -gt 0 -and $pool.Count -lt $ranked.Count
+  if (-not $pool.Count) { $pool = $ranked }
+  $pick = $pool | Select-Object -First 1
+  $backup = $pool | Select-Object -Skip 1 | Where-Object { $_.Provider -ne $pick.Provider } | Select-Object -First 1
+  if (-not $backup) { $backup = $pool | Select-Object -Skip 1 -First 1 }
   $why = Format-Server $pick
-  if ($pick -and -not $pick.CleanNow) { $why = "no $cityName server is clean right now; this one has the least loss ($why)" }
-  [pscustomobject]@{ Pick = $pick; Backup = $backup; Why = $why; Ranked = $ranked }
+  if ($pick -and -not $pick.CleanNow) { $why = "no $cityName server is clean right now; this one has the best track record ($why)" }
+  [pscustomobject]@{ Pick = $pick; Backup = $backup; Why = $why; Ranked = $ranked; Limited = $limited }
 }
 
 # ---------------------------------------------------------------- one run
@@ -776,6 +814,13 @@ function Invoke-Run {
   Write-Log "relaycheck-mullvad run"
   $vpn0 = Get-VpnState
   $run = $null
+
+  # Lockdown mode blocks all traffic while the app is disconnected, so the pings can't take the real route
+  if ($vpn0.Lockdown) {
+    Write-Log "mullvad lockdown mode is on, so the vpn can't be turned off for the pings; turn it off in the app's settings. skipping this run"
+    $script:RunFailure = 2
+    return
+  }
   try {
     if ($vpn0.Up) {
       Write-Log "disconnecting the laptop vpn while pinging"
@@ -799,7 +844,8 @@ function Invoke-Run {
     $diag = Get-Diagnosis $res $here $cityName $refName
     $ranks = Use-Db {
       param($db)
-      [pscustomobject]@{ Pick = (Get-Pick $db (Select-Group $res $cityName) $cityName); Ref = @(Get-Ranked $db $refName (Select-Group $res $refName)) }
+      $allowed = @($cityRelays | Where-Object { Test-Allowed $_ $vpn0 } | ForEach-Object { $_.Name })
+      [pscustomobject]@{ Pick = (Get-Pick $db (Select-Group $res $cityName) $cityName $allowed); Ref = @(Get-Ranked $db $refName (Select-Group $res $refName)) }
     }
     $pick = $ranks.Pick
 
@@ -938,12 +984,12 @@ function Format-Ladder($run) {
       "<span class=st><b class='$s'>$(Format-Html $s)</b><span class=mut>$(Format-Html $detail)</span>$defHtml</span></div>"
   }
 
-  # The tested line lists every target with its own result, or "ignores ping" for a router that never answers
+  # The tested line lists every target with its own result, or why a router isn't counted (see Test-Targets)
   $each = {
     param($g)
     $lines = Select-Group $res $g | ForEach-Object {
       $prov = if ($_.Provider -and $_.Name -notmatch '-wg-') { " ($(Format-Html $_.Provider))" } else { "" }
-      $result = if ($_.Ignored) { "ignores ping, not counted" } else { Format-Html (Format-Result $_) }
+      $result = if ($_.Ignored) { Format-Html "$($_.Why), not counted" } else { Format-Html (Format-Result $_) }
       "$(Format-Html $_.Name)$prov &middot; $result"
     }
     $lines -join "<br>"
@@ -1091,6 +1137,8 @@ td.prob small { display: block; font-size: var(--small); color: var(--mut); marg
   .step { grid-template-columns: 22px 1fr; }
   .st { grid-column: 2; align-items: flex-start; text-align: left; }
   .widesec, .midsec { left: 0; transform: none; width: auto; }
+  .speed { grid-template-columns: minmax(0, 1fr) minmax(56px, 1fr) auto; }
+  .speed > span { min-width: 0; overflow-wrap: anywhere; }
 }
 '@
 
@@ -1120,7 +1168,8 @@ $ReportJs = @'
     } else {
       btn.disabled = false;
       btn.textContent = "Run Now";
-      st.textContent = s.next ? "next automatic run " + fmt(s.next) + "." : "";
+      st.textContent = (s.failed ? "last run failed at " + fmt(s.ended) + ": " + s.failed + " " : "") +
+        (s.next ? "next automatic run " + fmt(s.next) + "." : "");
     }
   }
 
@@ -1202,7 +1251,7 @@ function Write-Report($run) {
   [void]$sb.Append("<header><div class=mut>$when ($utc) &middot; from $(Format-Html $from)</div>")
   [void]$sb.Append("<div class=runbox><span class=mut id=runstate></span><button id=stop class=ghost hidden>Stop Service</button><button id=run disabled>Run Now</button></div></header>")
   if ($h.ViaMullvad) {
-    [void]$sb.Append("<div class=banner>your router&rsquo;s mullvad tunnel is carrying this laptop, so these pings measured the tunnel, not the real route, and this run doesn&rsquo;t count towards the track record. turn it off for this laptop to get a real diagnosis.</div>")
+    [void]$sb.Append("<div class=banner>a mullvad tunnel outside the app (on your router, or a wireguard config) is carrying this laptop, so these pings measured the tunnel, not the real route. the speed test was skipped and this run doesn&rsquo;t count towards the track record. turn that tunnel off for this laptop to get a real diagnosis.</div>")
   }
 
   # Recommended server
@@ -1215,6 +1264,7 @@ function Write-Report($run) {
     [void]$sb.Append("<div class='card hero $heroTone'><div class=big>$(Format-Html $pp.Name)</div>")
     [void]$sb.Append("<div class=chips><span class=chip>provider $(Format-Html $pp.Provider)</span>$chips<span class=chip>clean $($pp.Clean) of $($pp.Runs) runs (${HistHours}h)</span></div>")
     if (-not $pp.CleanNow) { [void]$sb.Append("<p class='note mut'>$(Format-Html $p.Why)</p>") }
+    if ($p.Limited) { [void]$sb.Append("<p class='note mut'>only servers your mullvad app&rsquo;s provider and ownership settings allow are recommended.</p>") }
     if ($p.Backup) { [void]$sb.Append("<div class=sep><span class=mut>backup</span>&nbsp; <b>$(Format-Html $p.Backup.Name)</b> <span class=mut>&middot; $(Format-Html (Format-Server $p.Backup))</span></div>") }
     [void]$sb.Append("</div>")
   } else {
@@ -1254,7 +1304,7 @@ function Write-Report($run) {
     $t = if ($r.severity) { $r.severity } else { "n/a" }
     $prob = "<span class='pill $t'>$(Format-Html $r.problem)</span>"
     if ($r.diagnosis -and $t -ne "clean") { $prob += "<small>$(Format-Html $r.diagnosis)</small>" }
-    if ($r.router_vpn) { $prob += "<small>measured through the router&rsquo;s tunnel</small>" }
+    if ($r.router_vpn) { $prob += "<small>measured through a mullvad tunnel outside the app</small>" }
     $time = ([datetime]::ParseExact($r.time, $TimeFmt, $Inv)).ToString("d MMM, HH:mm", $Inv)
     $cells = @(
       "<td>$(Format-Html $time)</td>",
@@ -1270,7 +1320,19 @@ function Write-Report($run) {
     [void]$sb.Append("<tr data-t='$(Format-Html $r.time)'>$($cells -join '')</tr>")
   }
   [void]$sb.Append("</table></div></section>$ReportJs</main></body></html>")
-  Set-Content $Report $sb.ToString() -Encoding UTF8
+  # Written next to the report, then swapped in, so the dashboard never serves a half-written page
+  $tmp = "$Report.tmp"
+  Set-Content $tmp $sb.ToString() -Encoding UTF8
+  for ($i = 0; $i -lt 5; $i++) {
+    try {
+      # [NullString]: a plain $null reaches .NET as "", which Replace rejects as a backup path
+      if (Test-Path $Report) { [IO.File]::Replace($tmp, $Report, [NullString]::Value) } else { [IO.File]::Move($tmp, $Report) }
+      return
+    } catch {
+      Start-Sleep -Milliseconds 200
+    }
+  }
+  Write-Log "couldn't replace $Report; the new report is in $tmp"
 }
 
 # ---------------------------------------------------------------- local dashboard (-Serve)
@@ -1300,8 +1362,16 @@ function Start-Server([int]$port) {
   $startRun = {
     if ($st.Child -and -not $st.Child.HasExited) { return }
     $st.Child = Start-Process powershell -ArgumentList $childArgs -WindowStyle Hidden -PassThru
+    $null = $st.Child.Handle  # keeps the process handle open, so ExitCode is still readable after it exits
     $st.Started = Get-Date
     Write-Log "run started (pid $($st.Child.Id))"
+  }
+
+  # Why the last run wrote no report, from its exit code (see the main loop), or nothing if it didn't fail
+  $failure = {
+    if (-not $st.Child -or -not $st.Child.HasExited -or -not $st.Child.ExitCode) { return $null }
+    if ($st.Child.ExitCode -eq 2) { "mullvad lockdown mode is on, so the vpn can't be turned off for the pings. turn lockdown mode off in the mullvad app's settings." }
+    else { "the internet connection or the mullvad server list probably wasn't reachable." }
   }
   $send = {
     param($stream, $code, $type, [byte[]]$body)
@@ -1326,15 +1396,17 @@ function Start-Server([int]$port) {
       }
       $client = $listener.AcceptTcpClient()
       try {
-        # A short read timeout, so a browser preconnect that never sends anything can't stall the loop
+        # A short read timeout and an overall deadline, so a browser preconnect that never sends anything,
+        # or a client that sends slowly, can't stall the loop
         $ns = $client.GetStream()
         $ns.ReadTimeout = 500
         $buf = New-Object byte[] 8192
         $req = ""
+        $readUntil = [DateTime]::UtcNow.AddSeconds(2)
         do {
           $n = $ns.Read($buf, 0, $buf.Length)
           $req += [Text.Encoding]::ASCII.GetString($buf, 0, $n)
-        } while ($n -gt 0 -and $req -notmatch "`r`n`r`n")
+        } while ($n -gt 0 -and $req -notmatch "`r`n`r`n" -and [DateTime]::UtcNow -lt $readUntil)
 
         $lines = $req -split "`r`n"
         $method, $path = ($lines[0] -split " ")[0, 1]
@@ -1356,26 +1428,30 @@ function Start-Server([int]$port) {
             # Before the first report, start one check and serve a page that reloads until there is a report.
             # Only one: a check that fails writes no report, and starting another on every reload would keep
             # turning the vpn off.
+            $page = { param($refresh, $text) [Text.Encoding]::UTF8.GetBytes("<!doctype html><html lang=en><head><meta charset=utf-8><meta name=color-scheme content='light dark'><meta http-equiv=refresh content=$refresh><title>Relaycheck Mullvad</title></head><body><p>$text</p></body></html>") }
+            $code = "200 OK"
             if (Test-Path $Report) {
-              $body = [IO.File]::ReadAllBytes($Report)
+              # A run swaps the report in when it's done; if that happens mid-read, ask the browser to try again
+              try { $body = [IO.File]::ReadAllBytes($Report) } catch { $code = "503 Service Unavailable"; $body = & $page 1 "the report is being updated." }
             } else {
               if (-not $st.Started) { & $startRun }
-              $wait = if ($st.Child -and -not $st.Child.HasExited) {
-                5, "the first check is running and takes about a minute; this page reloads when it&rsquo;s done."
-              } elseif ($st.Next) {
-                30, "the first check finished without a report, usually because the internet connection failed. the next check starts at $($st.Next.ToString("HH:mm", $Inv))."
+              $why = & $failure
+              $next = if ($st.Next) { "the next check starts at $($st.Next.ToString("HH:mm", $Inv))." } else { "restart relaycheck-mullvad to try again." }
+              $body = if ($st.Child -and -not $st.Child.HasExited) {
+                & $page 5 "no report yet. the first check is running and takes about a minute; this page reloads when it&rsquo;s done."
               } else {
-                30, "the first check finished without a report, usually because the internet connection failed. restart relaycheck-mullvad to try again."
+                & $page 30 "no report yet. the first check failed: $(Format-Html $(if ($why) { $why } else { "it finished without writing a report." })) $next"
               }
-              $body = [Text.Encoding]::UTF8.GetBytes("<!doctype html><html lang=en><head><meta charset=utf-8><meta http-equiv=refresh content=$($wait[0])><title>Relaycheck Mullvad</title></head><body><p>no report yet. $($wait[1])</p></body></html>")
             }
-            & $send $ns "200 OK" "text/html; charset=utf-8" $body
+            & $send $ns $code "text/html; charset=utf-8" $body
             break
           }
           '^/status$' {
             $running = [bool]($st.Child -and -not $st.Child.HasExited)
             $last = if (Test-Path $Report) { (Get-Item $Report).LastWriteTimeUtc.ToString("o") } else { $null }
-            & $json $ns "200 OK" @{ running = $running; started = (& $iso $st.Started); last = $last; next = (& $iso $st.Next) }
+            $why = & $failure
+            $ended = if ($why) { & $iso $st.Child.ExitTime } else { $null }
+            & $json $ns "200 OK" @{ running = $running; started = (& $iso $st.Started); last = $last; next = (& $iso $st.Next); failed = $why; ended = $ended }
             break
           }
           '^/run$' {
@@ -1429,7 +1505,7 @@ function Show-Console($run) {
   ""
   "Problem:     $($d.Label) $Dot $($d.Text)"
   $pad + (($levels | ForEach-Object { "$($_[0]) $($_[1].Status) ($($_[1].Bad) of $($_[1].N) lossy)" }) -join " $Dot ")
-  if ($run.Here.ViaMullvad) { $pad + "note: your router's mullvad tunnel carried these pings, so this run doesn't count." }
+  if ($run.Here.ViaMullvad) { $pad + "note: a mullvad tunnel outside the app carried these pings, so the speed test was skipped and this run doesn't count." }
   if ($run.Speed) {
     $s = $run.Speed
     $mb = { param($v) if ($v -eq $null) { "no result" } else { "$v mbps" } }
@@ -1447,11 +1523,15 @@ if ($Serve) {
   return
 }
 do {
+  $script:RunFailure = 1
   $run = Invoke-Run
   if ($run) {
     Save-Run $run
     Write-Report $run
     Show-Console $run
+  } elseif ($Loop -le 0) {
+    # Tells the dashboard why this run wrote no report: 1 = it failed, 2 = mullvad lockdown mode is on
+    exit $script:RunFailure
   }
   if ($Loop -gt 0) {
     Write-Log "next run in $Loop min"

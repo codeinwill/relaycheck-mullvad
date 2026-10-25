@@ -44,9 +44,11 @@ Relaycheck Mullvad gets the server list from Mullvad's public API, not from the 
 
 The app is found automatically, on your `PATH` or in `C:\Program Files\Mullvad VPN`. If it isn't installed, the two steps that need it are skipped and the VPN row of the speed test shows no result.
 
+**Turn off the app's lockdown mode** ("Lockdown mode" in its VPN settings). It blocks all traffic while the app is disconnected, so the pings can't run: every run is skipped, and the dashboard says why.
+
 **If you use a VPN some other way, turn it off before running.** Relaycheck Mullvad can only turn off the Mullvad app. With a plain WireGuard config, a router tunnel or another provider's VPN, the pings go through that tunnel and describe its route, not your real connection.
 
-- **Mullvad tunnels** (your router's, or a WireGuard config) are detected, because am.i.mullvad.net reports a Mullvad exit. The page shows a warning, and the run doesn't count towards the track record.
+- **Mullvad tunnels** (your router's, or a WireGuard config) are detected, because am.i.mullvad.net reports a Mullvad exit. The page shows a warning, the speed test is skipped and the run doesn't count towards the track record.
 - **Other VPN providers** aren't detected, so the results would be misleading.
 
 ## What each run does
@@ -62,7 +64,7 @@ The app is found automatically, on your `PATH` or in `C:\Program Files\Mullvad V
    | seattle | every Mullvad server in the city under test |
    | provider | the city's servers grouped by hosting company |
 
-2. **Gives each level a state** from how many of its targets are lossy. A target is lossy at 4% loss or more (2 or more of 50 pings lost), or when it gives no reply.
+2. **Gives each level a state** from how many of its targets are lossy. A target is lossy at 4% loss or more (2 or more of 50 pings lost), or when it gives no reply. It's clean at 2% loss or less (at most 1 of 50 pings lost).
 
    | State | Share of the level's targets that are lossy |
    |---|---|
@@ -71,11 +73,13 @@ The app is found automatically, on your `PATH` or in `C:\Program Files\Mullvad V
    | degraded | more than 25%, less than 60% |
    | problem | 60% or more |
 
-   The headline is the first level from the top that is a problem, else the first that is degraded, else any lossy servers on their own (minor). A provider is only named when 2 or more of its servers are lossy and another provider is healthier. A router that never answers pings is shown as "ignores ping" and isn't counted.
+   The headline is the first level from the top that is a problem, else the first that is degraded, else any lossy servers on their own (minor). The reference level (us-west-coast) is only named when the city under test is at least as bad: it says the route is the problem, not Mullvad. Lossy reference servers on their own don't change the headline. A provider is only named when 2 or more of its servers are lossy and another provider is healthier.
 
-3. **Recommends a server:** one that's clean now and has the best track record over the last 24 hours, plus a backup from a different provider.
+   Two kinds of router aren't counted. One that never answers pings is shown as "ignores ping". One that loses pings while 1.1.1.1 and 8.8.8.8 are clean is shown as "limits pings to itself": many routers drop some pings aimed at themselves but pass traffic fine, and the clean targets beyond it show the traffic is fine.
 
-4. **Runs a speed test** on speedtest.net, the same server each time: first direct, then through the recommended server. It measures download and upload.
+3. **Recommends a server:** one that's clean now and has the best track record over the last 24 hours, plus a backup from a different provider. If no server is clean, it's the one with the best track record. Only servers the Mullvad app's provider and ownership settings allow are recommended, so the speed test can connect to them.
+
+4. **Runs a speed test** on speedtest.net: first direct, then through the recommended server. It measures download and upload. For Seattle and Los Angeles it uses the same speedtest.net server each time; for other cities, the first one that answers.
 
 5. **Saves the results** to `relaycheck-mullvad.db` and rebuilds `relaycheck-mullvad.html`.
 
@@ -85,7 +89,9 @@ The app is found automatically, on your `PATH` or in `C:\Program Files\Mullvad V
 - **Where's The Problem:** the headline and the full ladder. Each level shows what was tested and what its state means.
 - **Speed To Seattle:** download and upload, direct and through the VPN.
 - **Seattle Servers and Los Angeles Servers:** every server's loss, latency, jitter and how often it was clean over 24 hours and 7 days.
-- **Recent Runs:** history, and a **Flush Older Than 7 Days** button.
+- **Recent Runs:** the last 24 runs, and a **Flush Older Than 7 Days** button.
+
+Next to Run Now, the dashboard shows when the next automatic run is, and when the last run failed and why.
 
 ## Running it by hand
 
@@ -102,13 +108,13 @@ powershell -ExecutionPolicy Bypass -File relaycheck-mullvad.ps1 -City lax -RefCi
 | `-City` | `sea` | Mullvad city code to test |
 | `-RefCity` | `lax` | Mullvad city code used as the regional reference |
 | `-RegionName` | `us-west-coast` | label for the reference level |
-| `-Pings` | `50` | pings per target |
+| `-Pings` | `50` | pings per target (1 to 1000) |
 | `-Loop` | `0` | minutes between runs (0 = run once) |
-| `-Serve` | off | start the dashboard on localhost |
+| `-Serve` | off | start the dashboard on localhost; without `-Loop` it only runs on Run Now (and once at the start if there's no report yet) |
 | `-Port` | `8765` | dashboard port |
 | `-NoSpeed` | off | skip the speed test |
 
-The thresholds (clean and lossy loss, state shares, history windows, the international check's distance) are at the top of `relaycheck-mullvad.ps1`.
+The other settings are at the top of `relaycheck-mullvad.ps1`: the clean and lossy thresholds, state shares, history windows, the international check's distance, the slow-speed threshold for the speed notes (10 mbps), the number of recent runs shown and the preferred speedtest.net servers.
 
 ## Files
 
@@ -118,16 +124,18 @@ The thresholds (clean and lossy loss, state shares, history windows, the interna
 | `relaycheck-mullvad.ps1` | the whole program |
 | `relaycheck-mullvad.db` | results (SQLite), created on the first run |
 | `relaycheck-mullvad.html` | the latest report, rebuilt on every run |
+| `relaycheck-mullvad.db-wal`, `relaycheck-mullvad.db-shm` | SQLite's working files next to the database |
+| `relaycheck-mullvad.html.tmp` | the new report while it's being written; it then replaces the old one |
 
-`relaycheck-mullvad.db` and `relaycheck-mullvad.html` hold your public IP, ISP and location, so they're excluded from git.
+The database and report files hold your public IP, ISP and location, so they're all excluded from git.
 
 ### Database
 
 Open `relaycheck-mullvad.db` with [DB Browser for SQLite](https://sqlitebrowser.org).
 
-- `runs`: one row per run. Where you were, the diagnosis, the recommended server and backup, and speed results.
-- `checks`: one row per target per run. Level (`grp`), name, provider, IP, loss, latency and jitter.
+- `runs`: one row per run. Time and duration (`duration_s`), where you were (`ip`, `country`, `city`, `isp`), whether a Mullvad tunnel outside the app carried it (`router_vpn`), the diagnosis (`level`, `severity`, `problem`, `diagnosis`), the recommended server and backup (`pick`, `pick_why`, `backup`) and speed results (`speed_server`, `direct_down`, `direct_up`, `vpn_down`, `vpn_up`, `speed_note`).
+- `checks`: one row per target per run: `run_id`, the level (`grp`), `name`, `provider`, `ip`, `loss`, latency (`ms`) and `jitter`.
 
 ## Dashboard security
 
-The dashboard only listens on `127.0.0.1`. Run Now, Stop Service and Flush need a custom request header that other websites can't send without a CORS preflight, which the server never answers. Requests whose `Host` header isn't localhost are refused, which blocks DNS rebinding.
+The dashboard only listens on `127.0.0.1`. Run Now, Stop Service and Flush need a custom request header that other websites can't send without a CORS preflight, which the server never answers. Requests whose `Host` header isn't `localhost` or `127.0.0.1` on the dashboard's port are refused, which blocks DNS rebinding.
